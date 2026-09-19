@@ -198,6 +198,13 @@ def webapp_request(method: str, timeout: int, **kwargs) -> dict:
                 if "lock timeout" in err or "in progress" in err:
                     raise RuntimeError(f"Web App busy: {err}")
                 raise PermanentWebAppError(f"Web App {method} failed: {data}")
+            if method == "POST" and "rows_received" not in data:
+                # Seen on AV run #3 (2026-09-19, 09/18 window): the reply was
+                # the doGet health-check body ({"success":true,"message":"ok"})
+                # instead of doPost's counts - the googleusercontent redirect
+                # was answered as a GET. Whether the rows were written is
+                # unknown, and the upsert is idempotent, so post again.
+                raise RuntimeError(f"Web App POST answered without counts (treated as not written): {data}")
             return data
         except PermanentWebAppError:
             raise

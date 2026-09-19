@@ -1,0 +1,69 @@
+name: Pull AV Master Report (Periscope) to monthly Google Sheets
+
+on:
+  schedule:
+    # Four times a day at 00:07, 06:07, 12:07, 18:07 America/Bogota (BOG).
+    # Bogota is UTC-5 all year (no DST), so the offset never drifts:
+    #   05:07 UTC = 00:07 Bogota
+    - cron: '7 5 * * *'
+    #   11:07 UTC = 06:07 Bogota
+    - cron: '7 11 * * *'
+    #   17:07 UTC = 12:07 Bogota
+    - cron: '7 17 * * *'
+    #   23:07 UTC = 18:07 Bogota
+    - cron: '7 23 * * *'
+    # WHY :07 AND NOT :01 - GitHub queues scheduled workflows behind
+    # everything else that is scheduled at the same minute, and "the start
+    # of every hour" is its documented peak (docs: "The schedule event can
+    # be delayed during periods of high loads ... High load times include
+    # the start of every hour"). With ':1' the runs of 2026-09-04..09-18
+    # regularly started 2-4 HOURS late (e.g. the 18:01 slot at 20:06), which
+    # looked like the pipeline was stuck. An off-peak minute keeps the same
+    # 4x/day cadence while avoiding that queue.
+    # The scraper computes its D-2..D0 window at run time, so even a late
+    # run still pulls the right days, and every day is re-synced ~12 times.
+  workflow_dispatch:
+    inputs:
+      backfill_start:
+        description: 'Optional one-off catch-up: first day to re-pull (MM/DD/YYYY)'
+        required: false
+        default: ''
+      backfill_end:
+        description: 'Optional one-off catch-up: last day to re-pull (MM/DD/YYYY)'
+        required: false
+        default: ''
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run scrape and upload
+        env:
+          SHEETS_WEBAPP_URL: ${{ secrets.SHEETS_WEBAPP_URL }}
+          WEBAPP_TOKEN: ${{ secrets.WEBAPP_TOKEN }}
+          PERISCOPE_PASSWORD: ${{ secrets.PERISCOPE_PASSWORD }}
+          # Empty on scheduled runs -> the scraper uses its rotating backfill chunk.
+          BACKFILL_START: ${{ github.event.inputs.backfill_start }}
+          BACKFILL_END: ${{ github.event.inputs.backfill_end }}
+        run: python scrape_and_upload.py
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore

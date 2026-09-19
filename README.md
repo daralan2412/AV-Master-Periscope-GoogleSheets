@@ -14,7 +14,7 @@ different sheets, different Apps Script project, different secrets.
 | | |
 |---|---|
 | Source | https://app.periscopedata.com/shared/924434c7-8bb2-43c5-baf0-5ca251356bc6 (password gated; widget "Data", 46 columns) |
-| Window | **D-2 to D0** (today, yesterday, the day before; America/Bogota) **plus one rotating 3-day backfill chunk** per run (D-5..D-3, D-8..D-6, D-11..D-9, D-14..D-12 by slot), so every day is re-synced again up to two weeks after the fact |
+| Window | **D-2 to D0** (today, yesterday, the day before; America/Bogota) **plus one rotating 2-day backfill chunk** per run (D-4..D-3, D-6..D-5, D-8..D-7, D-10..D-9 by slot), so every day is re-synced again up to ten days after the fact. **Every window is scraped one day at a time** - Sisense refuses to render this widget above 10,000 rows and AV produces ~3-4k rows/day |
 | Schedule | **00:07, 06:07, 12:07, 18:07 America/Bogota** (`7 5,11,17,23 * * *` UTC; :07 avoids GitHub's top-of-hour queue that delayed the CM runs by hours) + manual `workflow_dispatch` (optional `backfill_start` / `backfill_end` inputs, MM/DD/YYYY, for a one-off catch-up) |
 | Target | Drive folder https://drive.google.com/drive/folders/1m7cpPLZsSEOfVL2ENSWwkq8wCbLWAo3a - one file per month, `<M>_<YYYY>_AV` (`8_2026_AV`, `9_2026_AV`, ...), tab whose A1 is `mission_sas_id` |
 | Columns | the files' 48-column header (which has a duplicated `task_15` and a trailing `USU_MES`); the report's 46 CSV columns are mapped onto it **by name**, the two extra columns stay blank |
@@ -30,8 +30,8 @@ different sheets, different Apps Script project, different secrets.
    page (from the `PERISCOPE_PASSWORD` secret), picks **Custom Range** in the
    Date Range filter, types the window's start/end (MM/DD/YYYY), applies,
    waits for the Data widget to settle, clicks its **Download Data** CSV
-   export and polls the `/download_csv/` URL until it returns 200 - once for
-   the primary D-2..D0 window and once for the backfill chunk.
+   export and polls the `/download_csv/` URL until it returns 200 - once per
+   day (three primary days + two backfill days per run).
 2. It maps the CSV onto the 48-column sheet header by name and POSTs
    `{"rows": [[...48 cols...], ...]}` to the Apps Script Web App
    (`apps-script/Code.gs`) with `?token=`. Every Web App call is retried up
@@ -72,15 +72,20 @@ widget genuinely has no rows). Open the "Run scrape and upload" step and
 look for:
 
 ```
-Windows this run (America/Bogota): primary D-2..D0 = 09/16/2026..09/18/2026; backfill slot 3 D-14..D-12 = 09/04/2026..09/06/2026
-Pulling 'AV - Master Report' data for 09/16/2026 to 09/18/2026 (primary D-2..D0)...
-Scraped 1234 rows for 09/16/2026 to 09/18/2026.
-Posted 1234 rows: 1100 updated in place, 134 appended; 0 stray duplicate row(s) removed, 0 wrong-month row(s) removed, 0 row(s) had no readable date and were skipped.
-  9_2026_AV: {'rows_received': 1234, 'rows_updated': 1100, 'rows_appended': 134, 'duplicates_removed': 0, 'wrong_month_removed': 0, 'total_rows': 5678}
+Windows this run (America/Bogota): primary D-2..D0 = 09/17/2026..09/17/2026; primary D-2..D0 = 09/18/2026..09/18/2026; primary D-2..D0 = 09/19/2026..09/19/2026; backfill slot 0 D-4..D-3 = 09/15/2026..09/15/2026; backfill slot 0 D-4..D-3 = 09/16/2026..09/16/2026
+Pulling 'AV - Master Report' data for 09/17/2026 to 09/17/2026 (primary D-2..D0)...
+Scraped 3812 rows for 09/17/2026 to 09/17/2026.
+Posted 3812 rows: 3790 updated in place, 22 appended; 0 stray duplicate row(s) removed, 0 wrong-month row(s) removed, 0 row(s) had no readable date and were skipped.
+  9_2026_AV: {'rows_received': 3812, 'rows_updated': 3790, 'rows_appended': 22, 'duplicates_removed': 0, 'wrong_month_removed': 0, 'total_rows': 9847}
 ```
 
+(one such block per day-window). A `TooManyRowsError ... Result set too large`
+line means a single day exceeded Sisense's 10,000-row widget limit - that
+window is not retried; the fix is a smaller `MAX_WINDOW_DAYS` (already 1) or
+splitting the report.
+
 Large "updated in place" counts are normal - every run re-posts the last
-three days plus an older 3-day chunk; "appended" is what is actually new since the previous run.
+three days plus an older 2-day chunk; "appended" is what is actually new since the previous run.
 A scrape step that finishes in single-digit seconds did not do the work.
 A `FAILED: Periscope password was not accepted` line means the
 `PERISCOPE_PASSWORD` secret is wrong or the report's password changed.

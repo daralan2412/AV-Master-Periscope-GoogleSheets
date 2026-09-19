@@ -52,7 +52,15 @@ template with the same DOM (confirmed live 2026-09-18 on this report):
     never existence, or every run silently reports "no rows";
   - whole-scrape retry with a fresh browser (SCRAPE_ATTEMPTS);
   - every Web App call retried (webapp_request) because Apps Script's
-    googleusercontent "echo" redirect intermittently 404s (CM runs #61/#62/#64).
+    googleusercontent "echo" redirect intermittently 404s (CM runs #61/#62/#64);
+  - ONE DAY PER WINDOW (MAX_WINDOW_DAYS = 1). Unlike CM/FedEx, this report
+    is big: Sisense refuses to render the widget above 10,000 rows ("Result
+    set too large. Data displayed in web browser is limited to 5MB, please
+    select fewer than 10,000 rows.") and then offers no "Download Data".
+    Run #1 (2026-09-19) pulled 9,825 rows for a 3-day window and its 3-day
+    backfill chunk hit the limit three times. AV is ~3-4k rows/day, so every
+    range is split into single-day scrapes, and the limit message is
+    detected and raised as a non-retryable error (see TooManyRowsError).
 """
 
 import csv
@@ -82,13 +90,18 @@ LOOKBACK_DAYS = 2  # "D-2 to D0": the day before yesterday, yesterday and today,
 # WHY (CM-Master audit, 2026-09-19): ~1% of rows only appear in the source
 # 6-7 days after their date, i.e. after the D-2..D0 window has moved past
 # them. Each run therefore also re-pulls one older chunk chosen by the run's
-# 6-hour slot (00:07 -> D-5..D-3, 06:07 -> D-8..D-6, 12:07 -> D-11..D-9,
-# 18:07 -> D-14..D-12), so every day is re-synced again at 3-5, 6-8, 9-11
-# and 12-14 days of age. Chunks are 3 days because 6-day Sisense windows
-# timed out at scheduled hours while 3-day ones never did. Rows are
+# 6-hour slot (00:07 -> D-4..D-3, 06:07 -> D-6..D-5, 12:07 -> D-8..D-7,
+# 18:07 -> D-10..D-9), so every day is re-synced again at 3-4, 5-6, 7-8
+# and 9-10 days of age. Every range is scraped one day at a time
+# (MAX_WINDOW_DAYS) because of the 10,000-row widget limit. Rows are
 # upserted, so this only ever adds/refreshes.
-BACKFILL_CHUNK_DAYS = 3
-BACKFILL_SLOTS = 4  # = number of runs per day
+BACKFILL_CHUNK_DAYS = 2  # days of backfill per run (scraped one day at a time)
+BACKFILL_SLOTS = 4  # = number of runs per day -> D-3..D-10 re-synced daily
+# Sisense will not render (and cannot export) more than 10,000 rows in the
+# Data widget, and this report produces ~3-4k rows per day. Every window is
+# therefore cut into MAX_WINDOW_DAYS-day pieces before scraping.
+MAX_WINDOW_DAYS = 1
+TOO_MANY_ROWS_MARKER = "Result set too large"
 # Manual override for a one-off catch-up (workflow_dispatch inputs or env):
 # BACKFILL_START="09/01/2026" BACKFILL_END="09/12/2026" replaces the rotating
 # chunk with that exact range (scraped in BACKFILL_CHUNK_DAYS pieces).
@@ -241,7 +254,7 @@ def compute_windows():
             c = min(a + timedelta(days=BACKFILL_CHUNK_DAYS - 1), b)
             windows.append(("manual backfill", _fmt(a), _fmt(c)))
             a = c + timedelta(days=1)
-        return windows
+        return split_windows(windows)
 
     slot = (now.hour // (24 // BACKFILL_SLOTS)) % BACKFILL_SLOTS
     end = today - timedelta(days=LOOKBACK_DAYS + 1 + slot * BACKFILL_CHUNK_DAYS)
@@ -249,7 +262,29 @@ def compute_windows():
     age_hi = (today - start).days
     age_lo = (today - end).days
     windows.append(("backfill slot %d D-%d..D-%d" % (slot, age_hi, age_lo), _fmt(start), _fmt(end)))
-    return windows
+    return split_windows(windows)
+
+
+def split_windows(windows):
+    """Cut every (label, start, end) range into MAX_WINDOW_DAYS-day pieces.
+    Labels keep their prefix ("primary ..." / "backfill ...") so main() still
+    knows which failures are fatal. A 3-day primary window becomes three
+    single-day windows, each scraped and posted on its own.
+    """
+    out = []
+    for label, start_str, end_str in windows:
+        a = datetime.strptime(start_str, "%m/%d/%Y").date()
+        b = datetime.strptime(end_str, "%m/%d/%Y").date()
+        while a <= b:
+            c = min(a + timedelta(days=MAX_WINDOW_DAYS - 1), b)
+            out.append((label, _fmt(a), _fmt(c)))
+            a = c + timedelta(days=1)
+    return out
+
+
+class TooManyRowsError(RuntimeError):
+    """Sisense refused to render the window (>10,000 rows). Retrying the same
+    window can never help - the window has to be smaller."""
 
 
 def unlock_report(page):
@@ -495,7 +530,10 @@ def scrape_window_csv(start_str, end_str):
                     const err = el.querySelector('.error-message');
                     const errVisible = !!err && err.offsetParent !== null;
                     const grid = el.querySelector('.ninja-grid');
-                    return errVisible || !!grid;
+                    // "Result set too large ... fewer than 10,000 rows" is a
+                    // third terminal state: no grid, no .error-message.
+                    const tooBig = (el.innerText || '').includes('Result set too large');
+                    return errVisible || !!grid || tooBig;
                 }""",
                 arg=widget_handle,
                 # Generous: on the scheduled 7am/7pm runs Sisense has been
@@ -514,6 +552,14 @@ def scrape_window_csv(start_str, end_str):
             if widget.locator(".error-message", has_text="no matching rows").is_visible():
                 browser.close()
                 return None
+
+            if TOO_MANY_ROWS_MARKER in (widget.inner_text() or ""):
+                browser.close()
+                raise TooManyRowsError(
+                    f"Sisense refused to render {start_str}-{end_str}: more than 10,000 rows "
+                    "in the window (widget says 'Result set too large'). Lower MAX_WINDOW_DAYS "
+                    "or the report has grown past ~10k rows/day."
+                )
 
             # Open the per-widget menu.
             widget.hover()
@@ -631,6 +677,8 @@ def scrape_with_retry(start_str, end_str):
     for attempt in range(1, SCRAPE_ATTEMPTS + 1):
         try:
             return scrape_window_csv(start_str, end_str)
+        except TooManyRowsError:
+            raise  # a smaller window is the only fix; a fresh browser is not
         except Exception as exc:  # noqa: BLE001 - deliberately broad, see above
             last_exc = exc
             print(f"Scrape attempt {attempt}/{SCRAPE_ATTEMPTS} for {start_str}-{end_str} failed: {exc}", file=sys.stderr)

@@ -106,5 +106,3 @@ A `FAILED: Periscope password was not accepted` line means the
 - Apps Script deployments are pinned to a version: after editing `Code.gs`
   in the Apps Script editor, **Deploy > Manage deployments > Edit > New
   version**, or the live `/exec` keeps running the old code.
-# AV-Master-Periscope-GoogleSheets
-Periscope AV Master Report to monthly Google Sheets (M_YYYY_AV), 4x daily via GitHub Actions and Apps Script

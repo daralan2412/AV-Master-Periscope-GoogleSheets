@@ -28,9 +28,10 @@ Flow (runs 4x a day: 00:07, 06:07, 12:07, 18:07 America/Bogota - see run.yml):
      Data" CSV export (NOT DOM scraping - the grid is virtualized, only the
      rows and columns near the viewport exist in the DOM; the CSV is
      generated server-side and is complete).
-  2. Map the CSV's 46 columns onto the monthly files' 48-column header BY
-     NAME (see SHEET_HEADERS / map_csv_to_sheet) and POST
-     {"rows": [[...48 cols...], ...]} to the Web App. The Web App upserts
+  2. Map the CSV's 46 columns onto the monthly files' 46-column standard
+     header BY NAME (see SHEET_HEADERS / map_csv_to_sheet) and POST
+     {"rows": [[...46 cols...], ...]} to the Web App. The Web App types the
+     values (real Date / datetime / number cells, see Code.gs) and upserts
      each row into its monthly file by mission_sas_id, then deletes any row
      whose "date" belongs to another month. Re-pulling D-2..D0 four times a
      day is therefore safe and expected - large "updated in place" counts
@@ -111,23 +112,22 @@ WEBAPP_URL = os.environ["SHEETS_WEBAPP_URL"]
 WEBAPP_TOKEN = os.environ["WEBAPP_TOKEN"]
 PERISCOPE_PASSWORD = os.environ["PERISCOPE_PASSWORD"]
 
-# Header row EXACTLY as it exists in the monthly "<M>_<YYYY>_AV" files
-# (48 columns). It carries two quirks the report's CSV does not have: a
-# duplicated "task_15" column (position 37) and a trailing "USU_MES"
-# column. Rows are mapped onto this header BY NAME (first occurrence of a
-# name wins; the second "task_15" and "USU_MES" are left blank), so the
-# report's 46 CSV columns can never be shifted by those extra columns.
+# STANDARD SCHEMA (v2, 2026-09-19): header row of every monthly
+# "<M>_<YYYY>_AV" file, 46 columns = the report's 46 CSV columns, same order.
+# (Until 2026-09-19 the files had 48 columns - a duplicated "task_15" and a
+# trailing "USU_MES" - and the old rows' task columns were not even aligned
+# with each other; all nine 2026 files were rewritten into this layout, see
+# apps-script/Code.gs "STANDARD SCHEMA".) Rows are still mapped BY NAME so a
+# reordered CSV export can never shift a column. Values are posted as the
+# CSV's text; the Web App types them (Date / datetime / number) on write.
 SHEET_HEADERS = [
     "mission_sas_id", "date", "station", "airline_code", "tail_number", "vessel_description",
     "gate", "job_name", "mission_name", "arr_flt", "dep_flt", "org_city", "dest_city",
     "arr_time", "dep_time", "disp_name", "agent_name", "mission_notes", "assign_time",
     "start_time", "finish_time",
     "task_1", "task_2", "task_3", "task_4", "task_5", "task_6", "task_7", "task_8", "task_9",
-    "task_10", "task_11", "task_12", "task_13", "task_14", "task_15",
-    "task_15",  # duplicated in the files' header - left blank
-    "task_16", "task_17", "task_18", "task_19", "task_20", "task_21", "task_22", "task_23",
-    "task_24", "task_25",
-    "USU_MES",  # not in the report - left blank
+    "task_10", "task_11", "task_12", "task_13", "task_14", "task_15", "task_16", "task_17",
+    "task_18", "task_19", "task_20", "task_21", "task_22", "task_23", "task_24", "task_25",
 ]
 
 # Column ORDER of the report's Data widget / CSV export (confirmed live
@@ -135,8 +135,8 @@ SHEET_HEADERS = [
 # code, tail number, vessel description, gate, job name, mission name, arr
 # flt, dep flt, org city, dest city, arr time, dep time, disp name, agent
 # name, mission notes, assign time, start time, finish time, task 1..task 25).
-CSV_HEADERS = SHEET_HEADERS[:36] + SHEET_HEADERS[37:47]  # 46 columns
-assert len(CSV_HEADERS) == 46 and len(SHEET_HEADERS) == 48
+CSV_HEADERS = list(SHEET_HEADERS)  # identical since v2
+assert len(CSV_HEADERS) == 46 and len(SHEET_HEADERS) == 46
 
 
 def _norm(h: str) -> str:
@@ -607,10 +607,10 @@ def scrape_window_csv(start_str, end_str):
 
 
 def map_csv_to_sheet(csv_text: str):
-    """Parse the CSV and re-shape every row onto SHEET_HEADERS (48 columns) by
+    """Parse the CSV and re-shape every row onto SHEET_HEADERS (46 columns) by
     header NAME. Unknown CSV columns are dropped with a warning; sheet columns
-    the CSV doesn't provide (second task_15, USU_MES) stay blank. Falls back
-    to positional mapping onto CSV_HEADERS if the CSV has no usable header.
+    the CSV doesn't provide stay blank. Falls back to positional mapping onto
+    CSV_HEADERS if the CSV has no usable header.
     """
     reader = csv.reader(io.StringIO(csv_text))
     try:

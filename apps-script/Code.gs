@@ -1,5 +1,5 @@
 /**
- * AV-Master-Periscope-GoogleSheets - Apps Script Web App  (v2, 2026-09-19)
+ * AV-Master-Periscope-GoogleSheets - Apps Script Web App  (v2.1, 2026-09-19)
  *
  * NEW, INDEPENDENT PROJECT. It shares nothing (no Script Properties, no
  * deployment, no sheet) with the Copa pipeline
@@ -50,7 +50,7 @@
  *        with the header row and the column formats.
  *        Rows are UPSERTED: a mission_sas_id already in the file has its
  *        row overwritten in place (freshest scrape wins), new ids are
- *        appended - so re-posting D-2..D0 four times a day never grows the
+ *        appended - so re-posting D-2..D0 every 2 hours never grows the
  *        file with duplicates. Then every touched file (plus the current
  *        month's file) gets a cleanup pass over columns A:B only:
  *          1. rows whose "date" belongs to a DIFFERENT month/year than the
@@ -70,6 +70,8 @@
  *                                         copy rows back from today's backup
  *   ?action=finalize&file=9_2026_AV       one-off: drop cols 47-48, tab name
  *   ?action=inspect&file=9_2026_AV        row/col counts + first data row types
+ *   POST action=alert&subject=&body=      email the owner (GitHub workflow,
+ *                                         after 2 consecutive failed runs)
  *
  * Both endpoints require ?token=<AUTH_TOKEN> (Script Property, Project
  * Settings > Script Properties). Put the same value in the GitHub secret
@@ -156,6 +158,16 @@ function doGet(e) {
 
 function doPost(e) {
   if (!checkToken_(e)) return jsonOut_({ success: false, error: 'unauthorized' });
+
+  // Form-encoded admin call from the GitHub workflow (no JSON body):
+  //   action=alert&subject=...&body=...  -> email the sheet owner.
+  if (e.parameter && e.parameter.action === 'alert') {
+    try {
+      return jsonOut_({ success: true, action: 'alert', result: sendAlert_(e.parameter.subject, e.parameter.body) });
+    } catch (err) {
+      return jsonOut_({ success: false, error: 'alert failed: ' + err });
+    }
+  }
 
   var body;
   try {
@@ -685,6 +697,29 @@ function inspectFile_(fileName) {
     maxCols: sheet.getMaxColumns(), header: header, row2_types: types,
     row2: sample.map(function (v) { return isDate_(v) ? Utilities.formatDate(v, TZ, 'yyyy-MM-dd HH:mm') : v; })
   };
+}
+
+// ---------------------------------------------------------------------------
+// Failure alert (2 consecutive failed GitHub runs -> email, see run.yml)
+// ---------------------------------------------------------------------------
+
+// Recipient: Script Property ALERT_EMAIL if set, else the account that
+// deployed the Web App (Execute as: Me). MailApp quota: 100 mails/day on a
+// consumer account - the workflow sends at most one per failed run (every
+// 2 hours), so that can never be reached.
+function sendAlert_(subject, body) {
+  var to = PropertiesService.getScriptProperties().getProperty('ALERT_EMAIL') || Session.getEffectiveUser().getEmail();
+  if (!to) throw new Error('no recipient (set Script Property ALERT_EMAIL)');
+  subject = String(subject || '[AV-Master pipeline] alert').slice(0, 250);
+  body = String(body || '(no body)').slice(0, 20000);
+  MailApp.sendEmail({ to: to, subject: subject, body: body, name: 'AV-Master pipeline' });
+  return { sent_to: to, subject: subject, remaining_daily_quota: MailApp.getRemainingDailyQuota() };
+}
+
+// Manual helper: run once from the editor to grant the mail scope and check
+// the alert email arrives.
+function debugSendTestAlert() {
+  Logger.log(JSON.stringify(sendAlert_('[AV-Master pipeline] test alert', 'This is a test of the 2-consecutive-failures alert. Sent from the Apps Script editor.')));
 }
 
 // ---------------------------------------------------------------------------

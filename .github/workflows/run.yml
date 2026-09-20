@@ -2,26 +2,20 @@ name: Pull AV Master Report (Periscope) to monthly Google Sheets
 
 on:
   schedule:
-    # Four times a day at 00:07, 06:07, 12:07, 18:07 America/Bogota (BOG).
-    # Bogota is UTC-5 all year (no DST), so the offset never drifts:
-    #   05:07 UTC = 00:07 Bogota
-    - cron: '7 5 * * *'
-    #   11:07 UTC = 06:07 Bogota
-    - cron: '7 11 * * *'
-    #   17:07 UTC = 12:07 Bogota
-    - cron: '7 17 * * *'
-    #   23:07 UTC = 18:07 Bogota
-    - cron: '7 23 * * *'
-    # WHY :07 AND NOT :01 - GitHub queues scheduled workflows behind
+    # Every 2 hours, at :07 past the odd UTC hours = the EVEN hours in
+    # America/Bogota (UTC-5, no DST): 00:07, 02:07, 04:07 ... 22:07 Bogota.
+    #   01:07 UTC = 20:07 Bogota, 05:07 UTC = 00:07 Bogota, and so on.
+    - cron: '7 1-23/2 * * *'
+    # WHY :07 AND NOT :00 - GitHub queues scheduled workflows behind
     # everything else that is scheduled at the same minute, and "the start
     # of every hour" is its documented peak (docs: "The schedule event can
     # be delayed during periods of high loads ... High load times include
-    # the start of every hour"). With ':1' the runs of 2026-09-04..09-18
-    # regularly started 2-4 HOURS late (e.g. the 18:01 slot at 20:06), which
-    # looked like the pipeline was stuck. An off-peak minute keeps the same
-    # 4x/day cadence while avoiding that queue.
-    # The scraper computes its D-2..D0 window at run time, so even a late
-    # run still pulls the right days, and every day is re-synced ~12 times.
+    # the start of every hour"). With ':01' the CM runs of 2026-09-04..09-18
+    # regularly started 2-4 HOURS late. Expect scheduled runs to start
+    # 5-30 minutes late anyway; the scraper computes its D-2..D0 window at
+    # run time, so a late run still pulls the right days.
+    # A failed run is simply retried by the next round two hours later; the
+    # "Alert" step below emails David when two consecutive runs fail.
   workflow_dispatch:
     inputs:
       backfill_start:
@@ -32,6 +26,16 @@ on:
         description: 'Optional one-off catch-up: last day to re-pull (MM/DD/YYYY)'
         required: false
         default: ''
+
+# Never let two runs scrape at the same time (a slow Sisense hour or a long
+# manual backfill overlapping the next scheduled run). The later run waits.
+concurrency:
+  group: av-master-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read   # the Alert step reads the previous run's conclusion
 
 jobs:
   scrape:
@@ -56,7 +60,9 @@ jobs:
           # Empty on scheduled runs -> the scraper uses its rotating backfill chunk.
           BACKFILL_START: ${{ github.event.inputs.backfill_start }}
           BACKFILL_END: ${{ github.event.inputs.backfill_end }}
-        run: python scrape_and_upload.py
+        run: |
+          set -o pipefail
+          python scrape_and_upload.py 2>&1 | tee run.log
 
       - name: Upload debug artifacts on failure
         if: failure()
@@ -66,4 +72,48 @@ jobs:
           path: |
             *.png
             *.html
+            run.log
           if-no-files-found: ignore
+
+      # Email alert after TWO consecutive failed runs (a single failure is
+      # left to the next round). The mail is sent by the Apps Script Web App
+      # (?action=alert, runs as the sheet owner, MailApp) so no SMTP secret
+      # is needed. Manual runs count too: two failures in a row of any kind
+      # trigger the alert, and it repeats on every further consecutive failure.
+      - name: Alert after 2 consecutive failures
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHEETS_WEBAPP_URL: ${{ secrets.SHEETS_WEBAPP_URL }}
+          WEBAPP_TOKEN: ${{ secrets.WEBAPP_TOKEN }}
+        run: |
+          prev=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "${GITHUB_WORKFLOW_REF##*/}" \
+                   --status completed --limit 1 --json conclusion,url,createdAt \
+                   --jq '.[0] | "\(.conclusion) \(.url) \(.createdAt)"' 2>/dev/null || true)
+          # GITHUB_WORKFLOW_REF looks like owner/repo/.github/workflows/run.yml@refs/heads/main
+          prev_conclusion=${prev%% *}
+          echo "Previous completed run: ${prev:-none}"
+          if [ "$prev_conclusion" != "failure" ]; then
+            echo "First failure in a row - no email; the next round will retry."
+            exit 0
+          fi
+          {
+            echo "AV-Master-Periscope-GoogleSheets: two consecutive runs FAILED."
+            echo
+            echo "This run:     $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Previous run: ${prev#* }"
+            echo "Time (UTC):   $(date -u +'%Y-%m-%d %H:%M')"
+            echo
+            echo "The pipeline keeps retrying every 2 hours; this email repeats while runs keep failing."
+            echo "Common causes: Periscope password changed (FAILED: Periscope password was not accepted),"
+            echo "Sisense down or slow (timeouts), Web App deployment/token changed."
+            echo
+            echo "---- last 40 lines of run.log ----"
+            tail -n 40 run.log 2>/dev/null || echo "(no run.log)"
+          } > alert_body.txt
+          curl -sS -L --max-time 120 \
+            --data-urlencode "token=$WEBAPP_TOKEN" \
+            --data-urlencode "action=alert" \
+            --data-urlencode "subject=[AV-Master pipeline] 2 consecutive failures - $(date -u +'%Y-%m-%d %H:%M UTC')" \
+            --data-urlencode "body@alert_body.txt" \
+            "$SHEETS_WEBAPP_URL" | head -c 500 || echo "alert request failed"

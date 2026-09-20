@@ -21,7 +21,7 @@ Target: one Google Sheet per month in Drive folder
         each row by the row's own "date" column, so a run on 2026-10-01 that
         pulls 09/30 and 10/01 rows lands them in 9_2026_AV and 10_2026_AV.
 
-Flow (runs 4x a day: 00:07, 06:07, 12:07, 18:07 America/Bogota - see run.yml):
+Flow (runs every 2 hours, at the even Bogota hours + 7 min - see run.yml):
   1. Open the report, submit the password, set the Date Range filter to a
      rolling "D-2 to D0" window (America/Bogota) plus one older 3-day backfill
      chunk (see BACKFILL_*) via Custom Range with computed Start/End dates, then use the Data widget's own "Download
@@ -33,7 +33,7 @@ Flow (runs 4x a day: 00:07, 06:07, 12:07, 18:07 America/Bogota - see run.yml):
      {"rows": [[...46 cols...], ...]} to the Web App. The Web App types the
      values (real Date / datetime / number cells, see Code.gs) and upserts
      each row into its monthly file by mission_sas_id, then deletes any row
-     whose "date" belongs to another month. Re-pulling D-2..D0 four times a
+     whose "date" belongs to another month. Re-pulling D-2..D0 twelve times a
      day is therefore safe and expected - large "updated in place" counts
      in the log are the normal steady state.
 
@@ -87,17 +87,19 @@ LOCAL_TZ = ZoneInfo("America/Bogota")  # BOG station time; UTC-5 all year (no DS
 # up in a window that starts on D0. D-2 covers both.
 LOOKBACK_DAYS = 2  # "D-2 to D0": the day before yesterday, yesterday and today, inclusive.
 
-# BACKFILL window - one extra, older 3-day chunk per run, rotating by slot.
+# BACKFILL window - one extra, older 2-day chunk per run, rotating by slot.
 # WHY (CM-Master audit, 2026-09-19): ~1% of rows only appear in the source
 # 6-7 days after their date, i.e. after the D-2..D0 window has moved past
 # them. Each run therefore also re-pulls one older chunk chosen by the run's
-# 6-hour slot (00:07 -> D-4..D-3, 06:07 -> D-6..D-5, 12:07 -> D-8..D-7,
-# 18:07 -> D-10..D-9), so every day is re-synced again at 3-4, 5-6, 7-8
-# and 9-10 days of age. Every range is scraped one day at a time
+# 2-hour slot (Bogota hour // 2): 00:07 -> D-4..D-3, 02:07 -> D-6..D-5, ...
+# 22:07 -> D-26..D-25, so with 12 runs a day every day from D-3 to D-26 is
+# re-synced once a day. Every range is scraped one day at a time
 # (MAX_WINDOW_DAYS) because of the 10,000-row widget limit. Rows are
-# upserted, so this only ever adds/refreshes.
+# upserted, so this only ever adds/refreshes. A run that GitHub starts an
+# hour late still lands in its own slot (slot boundaries are every 2 hours
+# and runs start at :07).
 BACKFILL_CHUNK_DAYS = 2  # days of backfill per run (scraped one day at a time)
-BACKFILL_SLOTS = 4  # = number of runs per day -> D-3..D-10 re-synced daily
+BACKFILL_SLOTS = 12  # = number of runs per day -> D-3..D-26 re-synced daily
 # Sisense will not render (and cannot export) more than 10,000 rows in the
 # Data widget, and this report produces ~3-4k rows per day. Every window is
 # therefore cut into MAX_WINDOW_DAYS-day pieces before scraping.
@@ -246,8 +248,8 @@ def compute_windows():
     - primary: D-2..D0 (see LOOKBACK_DAYS)
     - backfill: BACKFILL_START/BACKFILL_END if set (manual catch-up, cut into
       BACKFILL_CHUNK_DAYS pieces), else the rotating chunk for this run's
-      slot (see BACKFILL_CHUNK_DAYS). Slot = Bogota hour // 6, which still
-      lands right when GitHub starts a scheduled run a couple of hours late.
+      slot (see BACKFILL_CHUNK_DAYS). Slot = Bogota hour // 2 (12 slots a
+      day, one per scheduled run).
     """
     now = datetime.now(LOCAL_TZ)
     today = now.date()

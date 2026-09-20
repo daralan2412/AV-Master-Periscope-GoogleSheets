@@ -1,7 +1,7 @@
 # AV-Master-Periscope-GoogleSheets
 
 Pulls the Sisense/Periscope shared report **"AV - Master Report - In Progress"**
-into per-month Google Sheets, four times a day, on GitHub Actions.
+into per-month Google Sheets, every two hours, on GitHub Actions.
 
 This is a **new, independent pipeline**. It shares nothing with
 `daralan2412/CM-Master-Periscope-Googlesheets` (Copa),
@@ -14,14 +14,15 @@ different sheets, different Apps Script project, different secrets.
 | | |
 |---|---|
 | Source | https://app.periscopedata.com/shared/924434c7-8bb2-43c5-baf0-5ca251356bc6 (password gated; widget "Data", 46 columns) |
-| Window | **D-2 to D0** (today, yesterday, the day before; America/Bogota) **plus one rotating 2-day backfill chunk** per run (D-4..D-3, D-6..D-5, D-8..D-7, D-10..D-9 by slot), so every day is re-synced again up to ten days after the fact. **Every window is scraped one day at a time** - Sisense refuses to render this widget above 10,000 rows and AV produces ~3-4k rows/day |
-| Schedule | **00:07, 06:07, 12:07, 18:07 America/Bogota** (`7 5,11,17,23 * * *` UTC; :07 avoids GitHub's top-of-hour queue that delayed the CM runs by hours) + manual `workflow_dispatch` (optional `backfill_start` / `backfill_end` inputs, MM/DD/YYYY, for a one-off catch-up) |
+| Window | **D-2 to D0** (today, yesterday, the day before; America/Bogota) **plus one rotating 2-day backfill chunk** per run (12 slots, one per run: D-4..D-3 at 00:07, D-6..D-5 at 02:07 ... D-26..D-25 at 22:07), so every day from D-3 to D-26 is re-synced once a day. **Every window is scraped one day at a time** - Sisense refuses to render this widget above 10,000 rows and AV produces ~4-5k rows/day |
+| Schedule | **every 2 hours at the even Bogota hours + 7 min** (00:07, 02:07 ... 22:07 = `7 1-23/2 * * *` UTC; :07 avoids GitHub's top-of-hour queue that delayed the CM runs by hours; expect runs to start 5-30 min late anyway) + manual `workflow_dispatch` (optional `backfill_start` / `backfill_end` inputs, MM/DD/YYYY, for a one-off catch-up). Runs never overlap (`concurrency` group) |
 | Target | Drive folder https://drive.google.com/drive/folders/1m7cpPLZsSEOfVL2ENSWwkq8wCbLWAo3a - one file per month, `<M>_<YYYY>_AV` (`8_2026_AV`, `9_2026_AV`, ...), tab `DATA` (the one whose A1 is `mission_sas_id`) |
 | Columns | **standard 46-column schema** (v2, 2026-09-19): 21 fixed columns + `task_1..task_25`, same order as the report's CSV, mapped **by name**. Typed for dashboards: `mission_sas_id`, `arr_flt`, `dep_flt` are numbers; `date` is a real Date (`yyyy-mm-dd`); `arr_time`, `dep_time`, `assign_time`, `start_time`, `finish_time` are real datetimes (`yyyy-mm-dd HH:mm`); everything else (incl. `gate`) is text. Spreadsheet time zone America/Bogota, tab `DATA`, row 1 frozen |
 | Routing | each row goes to the file matching **its own `date` column** - a run on 1 Oct that pulls 30 Sep + 1 Oct rows writes to `9_2026_AV` **and** `10_2026_AV` |
 | Dedupe | **upsert** by `mission_sas_id`: an id already in the file is overwritten in place, new ids are appended (freshest scrape wins, file never grows with duplicates) |
 | Cleanup | any row whose `date` is from a different month than the file it sits in is **deleted** |
 | Missing file | a month file that doesn't exist yet is created in the folder with the header row |
+| Failures | a failed run is simply retried by the next round 2 hours later. After **two consecutive failed runs** the workflow emails the sheet owner (Web App `action=alert`, sent with MailApp as the deploying account; recipient overridable with Script Property `ALERT_EMAIL`) with both run links and the last 40 log lines, and repeats on every further consecutive failure |
 
 ## How it works
 
@@ -31,7 +32,7 @@ different sheets, different Apps Script project, different secrets.
    Date Range filter, types the window's start/end (MM/DD/YYYY), applies,
    waits for the Data widget to settle, clicks its **Download Data** CSV
    export and polls the `/download_csv/` URL until it returns 200 - once per
-   day (three primary days + two backfill days per run).
+   day (three primary days + two backfill days per run, ~8 min in total).
 2. It maps the CSV onto the 46-column standard header by name and POSTs
    `{"rows": [[...46 cols...], ...]}` (text, as exported) to the Apps Script Web App
    (`apps-script/Code.gs`) with `?token=`. Every Web App call is retried up
@@ -55,8 +56,9 @@ selector, slow default query at scheduled hours).
 ## Files
 
 - `scrape_and_upload.py` - the scraper (v2, 2026-09-19; based on CM-Master v1.5).
-- `.github/workflows/run.yml` - schedule + manual trigger; uploads
-  `debug_failure.png/.html` as artifacts when a run fails.
+- `.github/workflows/run.yml` - schedule + manual trigger + concurrency guard;
+  uploads `debug_failure.png/.html` and `run.log` as artifacts when a run
+  fails, and sends the 2-consecutive-failures email.
 - `apps-script/Code.gs`, `apps-script/appsscript.json` - the Web App
   (copy of what is deployed; editing here does not redeploy it).
 - `requirements.txt` - `requests`, `playwright`.
@@ -87,14 +89,17 @@ window is not retried; the fix is a smaller `MAX_WINDOW_DAYS` (already 1) or
 splitting the report.
 
 Large "updated in place" counts are normal - every run re-posts the last
-three days plus an older 2-day chunk; "appended" is what is actually new since the previous run.
+three days plus an older 2-day chunk; "appended" is what is actually new since the previous run (2 hours ago).
 A scrape step that finishes in single-digit seconds did not do the work.
 A `FAILED: Periscope password was not accepted` line means the
 `PERISCOPE_PASSWORD` secret is wrong or the report's password changed.
 
 ## Admin actions (GET, token-gated)
 
-- `?token=...` - health check.
+- `?token=...` - health check (`"version": 2`).
+- `POST token=...&action=alert&subject=...&body=...` (form-encoded) - email the
+  owner; used by the workflow's failure step. `debugSendTestAlert()` in the
+  editor sends a test mail (and is how the mail scope gets authorised).
 - `?token=...&action=rebuild&file=9_2026_AV` - run the dedupe +
   wrong-month cleanup on one file without posting anything.
 - `?token=...&action=inspect&file=9_2026_AV` - row/column counts, header,
